@@ -11,6 +11,7 @@
 #include <cctype>
 #include <regex>
 #include <stdexcept>
+#include <memory>
 
 namespace ut1
 {
@@ -94,5 +95,150 @@ std::vector<std::string> discoverFlightUrls(const std::string& pageUrl, const st
         catch (const std::runtime_error&) { }
     }
     return urls;
+}
+
+namespace
+{
+/// Read a URL component and release libcurl's allocated result.
+std::string urlPart(CURLU* url, CURLUPart part)
+{
+    char* value = nullptr;
+    if (curl_url_get(url, part, &value, 0) != CURLUE_OK) return {};
+    std::string result(value);
+    curl_free(value);
+    return result;
+}
+
+/// Build a validated HTTP URL handle.
+std::unique_ptr<CURLU, decltype(&curl_url_cleanup)> parsedHttpUrl(const std::string& value)
+{
+    std::unique_ptr<CURLU, decltype(&curl_url_cleanup)> url(curl_url(), curl_url_cleanup);
+    if (!url || curl_url_set(url.get(), CURLUPART_URL, value.c_str(), 0) != CURLUE_OK)
+        throw std::runtime_error("Invalid URL: " + value);
+    std::string scheme = lower(urlPart(url.get(), CURLUPART_SCHEME));
+    if ((scheme != "http" && scheme != "https") || urlPart(url.get(), CURLUPART_HOST).empty()
+        || !urlPart(url.get(), CURLUPART_USER).empty() || !urlPart(url.get(), CURLUPART_PASSWORD).empty())
+        throw std::runtime_error("Expected an HTTP(S) URL without embedded credentials: " + value);
+    return url;
+}
+
+/// Track response body size and overflow.
+struct BodyState
+{
+    /// Response bytes received so far.
+    std::string* body{};
+    /// Maximum accepted response bytes.
+    size_t limit{};
+    /// Whether the size limit was reached.
+    bool overflow{};
+};
+
+/// Receive a bounded response body.
+size_t receiveBounded(char* bytes, size_t size, size_t count, void* context)
+{
+    auto& state = *static_cast<BodyState*>(context);
+    size_t length = size * count;
+    if (length > state.limit - state.body->size()) { state.overflow = true; return 0; }
+    state.body->append(bytes, length);
+    return length;
+}
+
+/// Track redirect targets from HTTP response headers.
+struct HeaderState
+{
+    /// Original request URL, or the latest redirect target.
+    std::string currentUrl;
+    /// URLs found in Location headers.
+    std::vector<std::string>* redirects{};
+};
+
+/// Read Location headers from each redirect response.
+size_t receiveHeader(char* bytes, size_t size, size_t count, void* context)
+{
+    auto& state = *static_cast<HeaderState*>(context);
+    size_t length = size * count;
+    std::string line(bytes, length);
+    if (lower(line).starts_with("location:"))
+    {
+        std::string target = line.substr(9);
+        auto first = target.find_first_not_of(" \t");
+        auto last = target.find_last_not_of(" \t\r\n");
+        if (first != std::string::npos)
+        {
+            try
+            {
+                state.currentUrl = resolveHttpUrl(state.currentUrl, target.substr(first, last - first + 1));
+                state.redirects->push_back(state.currentUrl);
+            }
+            catch (const std::runtime_error&) { }
+        }
+    }
+    return length;
+}
+}
+
+std::string resolveHttpUrl(const std::string& baseUrl, const std::string& reference)
+{
+    auto url = parsedHttpUrl(baseUrl);
+    if (curl_url_set(url.get(), CURLUPART_URL, reference.c_str(), 0) != CURLUE_OK)
+        throw std::runtime_error("Invalid URL reference: " + reference);
+    curl_url_set(url.get(), CURLUPART_FRAGMENT, nullptr, 0);
+    parsedHttpUrl(urlPart(url.get(), CURLUPART_URL));
+    return urlPart(url.get(), CURLUPART_URL);
+}
+
+std::string httpUrlHostname(const std::string& value)
+{
+    auto url = parsedHttpUrl(value);
+    return lower(urlPart(url.get(), CURLUPART_HOST));
+}
+
+std::string httpUrlOrigin(const std::string& value)
+{
+    auto url = parsedHttpUrl(value);
+    std::string scheme = lower(urlPart(url.get(), CURLUPART_SCHEME));
+    std::string port = urlPart(url.get(), CURLUPART_PORT);
+    if (port.empty()) port = scheme == "https" ? "443" : "80";
+    return scheme + "://" + lower(urlPart(url.get(), CURLUPART_HOST)) + ":" + port;
+}
+
+DetailedHttpResponse httpGetDetailed(const std::string& value, const HttpRequestOptions& options)
+{
+    parsedHttpUrl(value);
+    std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> handle(curl_easy_init(), curl_easy_cleanup);
+    if (!handle) throw std::runtime_error("Unable to initialize libcurl");
+    DetailedHttpResponse response;
+    BodyState body{&response.body, options.maxBytes, false};
+    HeaderState headers{value, &response.redirectUrls};
+    curl_easy_setopt(handle.get(), CURLOPT_URL, value.c_str());
+    curl_easy_setopt(handle.get(), CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(handle.get(), CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(handle.get(), CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(handle.get(), CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(handle.get(), CURLOPT_USERAGENT, "getpageurls/1.0");
+    curl_easy_setopt(handle.get(), CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(handle.get(), CURLOPT_WRITEFUNCTION, receiveBounded);
+    curl_easy_setopt(handle.get(), CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(handle.get(), CURLOPT_HEADERFUNCTION, receiveHeader);
+    curl_easy_setopt(handle.get(), CURLOPT_HEADERDATA, &headers);
+    curl_easy_setopt(handle.get(), CURLOPT_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(handle.get(), CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+    if (!options.user.empty())
+    {
+        curl_easy_setopt(handle.get(), CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+        curl_easy_setopt(handle.get(), CURLOPT_USERNAME, options.user.c_str());
+        curl_easy_setopt(handle.get(), CURLOPT_PASSWORD, options.password.c_str());
+    }
+    CURLcode code = curl_easy_perform(handle.get());
+    curl_easy_getinfo(handle.get(), CURLINFO_RESPONSE_CODE, &response.status);
+    char* effective = nullptr;
+    curl_easy_getinfo(handle.get(), CURLINFO_EFFECTIVE_URL, &effective);
+    response.effectiveUrl = effective ? effective : value;
+    char* contentType = nullptr;
+    curl_easy_getinfo(handle.get(), CURLINFO_CONTENT_TYPE, &contentType);
+    if (contentType) response.contentType = lower(std::string(contentType).substr(0, std::string(contentType).find(';')));
+    if (body.overflow) throw std::runtime_error("Response exceeds size limit: " + value);
+    if (code != CURLE_OK) throw std::runtime_error("HTTP GET " + value + ": " + curl_easy_strerror(code));
+    return response;
 }
 }
